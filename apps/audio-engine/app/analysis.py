@@ -53,7 +53,7 @@ def track_pitch_in_chunks(y, sr, hop, progress=lambda *args: None, chunk_seconds
         a=start-context_start; b=end-context_start
         if len(f0)<b: raise RuntimeError('Pitch tracker returned an incomplete frame sequence.')
         f0_parts.append(f0[a:b]); probability_parts.append(probability[a:b])
-        progress(25+round(35*end/total_frames),f'Tracking vocal pitch ({min(round(end/total_frames*100),100)}%)')
+        progress(25+round(35*end/total_frames),f'Tracking part {start//chunk_frames+1} of {int(np.ceil(total_frames/chunk_frames))} ({min(round(end/total_frames*100),100)}%)')
     return np.concatenate(f0_parts), np.concatenate(probability_parts)
 
 def analyse(y, sr, progress=lambda *args: None):
@@ -75,7 +75,9 @@ def analyse(y, sr, progress=lambda *args: None):
     f0, probability=track_pitch_in_chunks(y,sr,hop,progress)
     midi_float=librosa.hz_to_midi(f0)
     # Median filter pitch only within voiced islands to prevent glides and vibrato fragmenting notes.
-    mask=np.isfinite(midi_float) & (probability >= .35)
+    # pYIN already returns NaN for unvoiced frames. A lower gate retains
+    # softer voiced segments; the trade-off is more false positives in noise.
+    mask=np.isfinite(midi_float) & (probability >= .10)
     smooth=np.full_like(midi_float,np.nan)
     starts=np.where(mask & ~np.r_[False,mask[:-1]])[0]
     ends=np.where(mask & ~np.r_[mask[1:],False])[0]+1

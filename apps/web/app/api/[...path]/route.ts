@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 const base = process.env.AUDIO_ENGINE_URL || "http://127.0.0.1:8000";
-// Allow multipart overhead in addition to the engine's 25 MiB file limit.
-const maxBody = 26 * 1024 * 1024;
+// Allow multipart overhead in addition to the engine's default 64 MiB file limit.
+const maxBody = 65 * 1024 * 1024;
 async function forward(
   req: NextRequest,
   ctx: { params: Promise<{ path: string[] }> },
@@ -27,7 +27,7 @@ async function forward(
       const length = Number(req.headers.get("content-length") || 0);
       if (length > maxBody)
         return NextResponse.json(
-          { detail: "Upload exceeds the 25 MB file limit." },
+          { detail: "Upload exceeds the 64 MiB file limit." },
           { status: 413 },
         );
       if (!req.body)
@@ -45,7 +45,7 @@ async function forward(
         if (total > maxBody) {
           await reader.cancel();
           return NextResponse.json(
-            { detail: "Upload exceeds the 25 MB file limit." },
+            { detail: "Upload exceeds the 64 MiB file limit." },
             { status: 413 },
           );
         }

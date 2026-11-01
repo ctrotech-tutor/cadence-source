@@ -117,7 +117,7 @@ def test_long_job_stays_responsive_and_preserves_chunk_boundary():
     from fastapi.testclient import TestClient
     from app.main import app
     import io, soundfile as sf, time
-    sr=22050; t=np.arange(sr*18)/sr
+    sr=22050; t=np.arange(sr*65)/sr
     tone=.4*np.sin(2*np.pi*440*t).astype('float32')
     buf=io.BytesIO();sf.write(buf,tone,sr,format='WAV');buf.seek(0)
     with TestClient(app) as client:
@@ -133,7 +133,7 @@ def test_long_job_stays_responsive_and_preserves_chunk_boundary():
     assert job['status']=='completed',job
     assert slowest<5, f'Polling stalled for {slowest:.1f}s'
     assert [n['midi'] for n in job['result']['notes']]==[69]
-    assert job['result']['notes'][0]['end']>17.8
+    assert job['result']['notes'][0]['end']>64.8
     assert 'processing' in observed
 
 def test_worker_timeout_reports_actionable_error(monkeypatch):
@@ -151,3 +151,63 @@ def test_worker_timeout_reports_actionable_error(monkeypatch):
             time.sleep(.1)
     assert job['status']=='failed'
     assert 'shorter section' in job['message']
+
+
+def test_noise_without_pitch_not_transcribed():
+    import pytest
+    rng=np.random.default_rng(71)
+    with pytest.raises(ValueError, match='No clear pitched notes'):
+        analyse(rng.normal(0,.01,22050*3).astype('float32'),22050)
+
+def test_selecting_stereo_channel_uses_the_requested_source():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    import io, soundfile as sf, time
+    sr=22050; t=np.arange(sr*2)/sr
+    stereo=np.stack([.4*np.sin(2*np.pi*130.8128*t),.4*np.sin(2*np.pi*440*t)],axis=1)
+    samples=io.BytesIO(); sf.write(samples,stereo,sr,format='WAV'); payload=samples.getvalue()
+    with TestClient(app) as client:
+        assert client.post('/jobs',data={'channel':'invalid'},files={'file':('x.wav',payload,'audio/wav')}).status_code==422
+        for channel, expected in [('left',48),('right',69)]:
+            response=client.post('/jobs',data={'channel':channel},files={'file':('stereo.wav',payload,'audio/wav')})
+            assert response.status_code==202
+            deadline=time.monotonic()+60
+            while time.monotonic()<deadline:
+                job=client.get('/jobs/'+response.json()['id']).json()
+                if job['status'] in ('failed','completed'): break
+                time.sleep(.1)
+            assert job['status']=='completed',job
+            assert job['result']['inputChannel']==channel
+            assert job['result']['notes'][0]['midi']==expected
+
+def test_duration_limit_asks_for_shorter_section(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app.main as main
+    import io, soundfile as sf, time
+    monkeypatch.setattr(main,'MAX_SECONDS',1)
+    buffer=io.BytesIO();sf.write(buffer,np.zeros(22050*2),22050,format='WAV');buffer.seek(0)
+    with TestClient(main.app) as client:
+        response=client.post('/jobs',files={'file':('long.wav',buffer,'audio/wav')})
+        assert response.status_code==202
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            job=client.get('/jobs/'+response.json()['id']).json()
+            if job['status'] in ('failed','completed'):break
+            time.sleep(.1)
+    assert job['status']=='failed' and 'shorter section' in job['message']
+
+def test_right_channel_of_mono_audio_reports_silent_channel():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    import io, soundfile as sf, time
+    sr=22050; t=np.arange(sr)/sr;buffer=io.BytesIO()
+    sf.write(buffer,.3*np.sin(2*np.pi*440*t),sr,format='WAV');buffer.seek(0)
+    with TestClient(app) as client:
+        response=client.post('/jobs',data={'channel':'right'},files={'file':('mono.wav',buffer,'audio/wav')})
+        assert response.status_code==202
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            job=client.get('/jobs/'+response.json()['id']).json()
+            if job['status'] in ('failed','completed'):break
+            time.sleep(.1)
+    assert job['status']=='failed' and 'right channel is silent or unavailable' in job['message']

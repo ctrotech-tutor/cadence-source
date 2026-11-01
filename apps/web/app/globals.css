@@ -1587,3 +1587,16 @@ h1 {
 .solfa-note.sounding small {
   color: #394e2a;
 }
+
+.part-selector { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; font-size: 10px; color: #a5b2a0; max-width: 260px; }
+.part-selector select { background: #252d24; border: 1px solid #465442; color: #e7ece1; border-radius: 3px; padding: 8px; }
+.show-part-check { display: flex; align-items: center; gap: 6px; color: #a5b2a0; font-size: 11px; margin-top: 14px; }
+.show-part-check input { accent-color: var(--lime); }
+.part-note { color: #a1af9c; font-size: 11px; line-height: 1.5; margin-top: 14px; }
+.solfa-note .review-note { color: #e7c682; font-weight: 700; }
+.solfa-note.sounding .review-note { color: #4f3d1b; }
+.channel-choice { margin-top: 14px; color: #a5b2a0; font-size: 11px; }
+.channel-choice label { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.channel-choice select { color: #e7ece1; background: #252d24; border: 1px solid #465442; border-radius: 3px; padding: 7px; }
+.channel-choice p { margin: 7px 0 0; color: #91a08b; font-size: 10px; line-height: 1.5; }
+.channel-choice.compact { margin-top: 12px; }

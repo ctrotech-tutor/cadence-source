@@ -53,6 +53,7 @@ type Result = {
   range: string;
   warnings: string[];
   method: string;
+  inputChannel?: "mix" | "left" | "right";
 };
 type Project = {
   id: string;
@@ -63,6 +64,7 @@ type Project = {
   filename: string;
   selectedKey?: Key;
   transpose?: number | null;
+  audioChannel?: "mix" | "left" | "right";
 };
 const names = ["C", "C♯", "D", "E♭", "E", "F", "F♯", "G", "A♭", "A", "B♭", "B"];
 const maj = ["d", "di", "r", "ri", "m", "f", "fi", "s", "si", "l", "li", "t"];
@@ -170,7 +172,8 @@ function download(data: BlobPart, name: string, type: string) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(u), 1000);
 }
-function wav(buffer: AudioBuffer, start: number, end: number) {
+function wav(buffer: AudioBuffer, start: number, end: number, channel: "mix" | "left" | "right") {
+  if (channel === "right" && buffer.numberOfChannels < 2) throw Error("This recording has no right channel. Choose Mix or Left channel.");
   const sr = buffer.sampleRate;
   const a = Math.floor(start * sr),
     b = Math.min(buffer.length, Math.floor(end * sr));
@@ -194,8 +197,9 @@ function wav(buffer: AudioBuffer, start: number, end: number) {
   v.setUint32(40, (b - a) * 2, true);
   for (let i = a; i < b; i++) {
     let x = 0;
-    for (let c = 0; c < buffer.numberOfChannels; c++)
-      x += buffer.getChannelData(c)[i] / buffer.numberOfChannels;
+    if (channel === "mix") {
+      for (let c = 0; c < buffer.numberOfChannels; c++) x += buffer.getChannelData(c)[i] / buffer.numberOfChannels;
+    } else x = buffer.getChannelData(channel === "left" ? 0 : 1)[i];
     v.setInt16(44 + (i - a) * 2, Math.max(-1, Math.min(1, x)) * 32767, true);
   }
   return new Blob([out], { type: "audio/wav" });
@@ -206,6 +210,7 @@ export default function Home() {
   const [tab, setTab] = useState<"record" | "upload">("record");
   const [audio, setAudio] = useState<Blob | null>(null);
   const [filename, setFilename] = useState("");
+  const [audioChannel, setAudioChannel] = useState<"mix" | "left" | "right">("mix");
   const [url, setUrl] = useState("");
   const [duration, setDuration] = useState(0);
   const [current, setCurrent] = useState(0);
@@ -237,6 +242,8 @@ export default function Home() {
   const [sectionEnd, setSectionEnd] = useState(0);
   const [sectionOnly, setSectionOnly] = useState(false);
   const [sectionName, setSectionName] = useState("Selection");
+  const [sectionPreset, setSectionPreset] = useState("");
+  const [showSelectedNotes, setShowSelectedNotes] = useState(false);
   const [loopSection, setLoopSection] = useState(false);
   const [editStart, setEditStart] = useState("");
   const [editEnd, setEditEnd] = useState("");
@@ -268,55 +275,48 @@ export default function Home() {
     };
   }, [refresh]);
   useEffect(() => {
-    if (!audio) {
-      setUrl("");
-      setWave([]);
-      return;
-    }
-    const u = URL.createObjectURL(audio);
-    setUrl(u);
-    let alive = true;
-    const c = new AudioContext();
-    audio
-      .arrayBuffer()
-      .then((b) => c.decodeAudioData(b))
-      .then((b) => {
-        if (!alive) return;
-        setDuration(b.duration);
-        setSectionEnd(Math.floor(b.duration * 100) / 100);
-        const channel = b.getChannelData(0),
-          buckets = 180,
-          step = Math.max(1, Math.floor(channel.length / buckets)),
-          v = [];
-        for (let i = 0; i < buckets; i++) {
-          let peak = 0;
-          for (
-            let j = i * step;
-            j < Math.min((i + 1) * step, channel.length);
-            j += Math.max(1, Math.floor(step / 100))
-          )
-            peak = Math.max(peak, Math.abs(channel[j]));
-          v.push(peak);
-        }
+    if (!audio) { setUrl(""); setWave([]); return; }
+    const u=URL.createObjectURL(audio); setUrl(u);
+    let alive=true;
+    const probe=document.createElement("audio"); probe.preload="metadata";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const readMetadata=() => new Promise<number | null>((resolve) => {
+      let settled=false;
+      const finish=(value:number|null) => { if(settled)return; settled=true; if(timer)clearTimeout(timer); resolve(value); };
+      probe.onloadedmetadata=()=>finish(Number.isFinite(probe.duration) ? probe.duration : null);
+      probe.onerror=()=>finish(null);
+      timer=setTimeout(()=>finish(null),5000); probe.src=u; probe.load();
+    });
+    void (async () => {
+      const metadataDuration=await readMetadata();
+      if(!alive)return;
+      if(metadataDuration!==null){setDuration(metadataDuration);setSectionEnd(Math.floor(metadataDuration*100)/100);}
+      if(metadataDuration!==null && metadataDuration>600){
+        setWave([]);setError("This recording is over 10 minutes. Trim it in an audio editor before importing; the limit protects your device's memory.");return;
+      }
+      // MediaRecorder WebM may omit duration metadata; small files can still be decoded.
+      if(metadataDuration===null && audio.size>8*1024*1024){
+        setWave([]);setError("The browser could not read the duration safely. Try a shorter WAV or MP3, or analyse the original file without a section preview.");return;
+      }
+      let c: AudioContext | undefined;
+      try{
+        c=new AudioContext(); const b=await c.decodeAudioData(await audio.arrayBuffer());
+        if(!alive)return;
+        setDuration(b.duration);setSectionEnd(Math.floor(b.duration*100)/100);
+        const channel=b.getChannelData(0),buckets=180,step=Math.max(1,Math.floor(channel.length/buckets)),v=[];
+        for(let i=0;i<buckets;i++){let peak=0;for(let j=i*step;j<Math.min((i+1)*step,channel.length);j+=Math.max(1,Math.floor(step/100)))peak=Math.max(peak,Math.abs(channel[j]));v.push(peak)}
         setWave(v);
-      })
-      .catch(() => {
-        if (alive)
-          setError(
-            "Could not preview this audio in your browser. You can still try analysis.",
-          );
-      })
-      .finally(() => c.close());
-    return () => {
-      alive = false;
-      URL.revokeObjectURL(u);
-    };
+      } catch {if(alive)setError("Could not preview this audio in your browser. You can still try analysis.");}
+      finally {if(c)await c.close().catch(()=>{});}
+    })();
+    return ()=>{alive=false;if(timer)clearTimeout(timer);probe.removeAttribute("src");probe.load();URL.revokeObjectURL(u)};
   }, [audio]);
   function reset() {
     analysisVersion.current++;
     setBusy(false);
     setAudio(null);
     setFilename("");
+    setAudioChannel("mix");
     setResult(null);
     setSelectedKey(null);
     setTranspose(null);
@@ -330,6 +330,8 @@ export default function Home() {
     setSectionStart(0);
     setSectionOnly(false);
     setSectionName("Selection");
+    setSectionPreset("");
+    setShowSelectedNotes(false);
     setLoopSection(false);
     playingSelection.current = false;
     setView("workspace");
@@ -338,8 +340,8 @@ export default function Home() {
     analysisVersion.current++;
     setBusy(false);
     setError("");
-    if (file.size > 25 * 1024 * 1024) {
-      setError("File is larger than 25 MB. Please choose a smaller file.");
+    if (file.size > 64 * 1024 * 1024) {
+      setError("File is larger than 64 MiB. Please choose a smaller file.");
       return;
     }
     if (!file.size) {
@@ -347,6 +349,7 @@ export default function Home() {
       return;
     }
     setAudio(file);
+    setAudioChannel("mix");
     setFilename(file.name);
     setTitle(file.name.replace(/\.[^.]+$/, "") || "Untitled melody");
     setResult(null);
@@ -392,6 +395,7 @@ export default function Home() {
         });
         if (blob.size) {
           setAudio(blob);
+          setAudioChannel("mix");
           setFilename("Voice recording.webm");
           setTitle("Voice recording");
           setResult(null);
@@ -490,6 +494,7 @@ export default function Home() {
       let input = audio;
       const useSection = sectionOnly || forceSection;
       if (useSection) {
+        if (duration > 600) throw Error("Trim recordings over 10 minutes in an audio editor before importing.");
         if (
           sectionStart < 0 ||
           sectionEnd > duration ||
@@ -501,13 +506,15 @@ export default function Home() {
         const ac = new AudioContext();
         try {
           const decoded = await ac.decodeAudioData(await audio.arrayBuffer());
-          input = wav(decoded, sectionStart, sectionEnd);
+          input = wav(decoded, sectionStart, sectionEnd, audioChannel);
         } finally {
           await ac.close();
         }
       }
       const form = new FormData();
       form.append("file", input, filename || "recording.webm");
+      // A selected section is encoded as mono using the selected source channel.
+      form.append("channel", useSection ? "mix" : audioChannel);
       const id = await new Promise<string>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", "/api/jobs");
@@ -534,7 +541,7 @@ export default function Home() {
       if (version !== analysisVersion.current) return;
       let finished = false;
       let transientFailures = 0;
-      const deadline = Date.now() + 8 * 60 * 1000;
+      const deadline = Date.now() + 25 * 60 * 1000;
       while (!finished) {
         if (version !== analysisVersion.current) return;
         if (Date.now() > deadline)
@@ -546,14 +553,14 @@ export default function Home() {
         try {
           response = await fetch("/api/jobs/" + id, { cache: "no-store" });
         } catch {
-          if (++transientFailures <= 3) {
+          if (++transientFailures <= 12) {
             setStatus("Connection interrupted. Retrying status…");
             continue;
           }
           throw Error("Could not contact the audio engine. Check its terminal, then try again.");
         }
         if (version !== analysisVersion.current) return;
-        if (response.status === 503 && ++transientFailures <= 3) {
+        if (response.status === 503 && ++transientFailures <= 12) {
           setStatus("Audio engine is slow to respond. Retrying status…");
           continue;
         }
@@ -566,6 +573,7 @@ export default function Home() {
         if (job.status === "failed") throw Error(job.message);
         if (job.status === "completed") {
           let res = job.result as Result;
+          if (useSection) res = {...res, inputChannel: audioChannel};
           if (useSection) {
             res = {
               ...res,
@@ -583,6 +591,13 @@ export default function Home() {
           if (!duration) {
             setDuration(res.duration);
             setSectionEnd(res.duration);
+          }
+          if (!useSection && (duration || res.duration) > 60) {
+            setSectionStart(0);
+            setSectionEnd(Math.min(30, duration || res.duration));
+            setSectionName("Part 1");
+            setSectionPreset("0");
+            setShowSelectedNotes(true);
           }
           setResult(res);
           setSelectedKey(res.key);
@@ -640,6 +655,9 @@ export default function Home() {
           };
         })
       : [];
+  const visibleNotes = displayed
+    .map((note, index) => ({ note, index }))
+    .filter(({ note }) => !showSelectedNotes || (note.end > sectionStart && note.start < sectionEnd));
   async function save() {
     if (!result || !audio) return;
     try {
@@ -657,6 +675,7 @@ export default function Home() {
         },
         selectedKey: selectedKey || result.key,
         transpose,
+        audioChannel,
         audio,
         filename,
       });
@@ -675,6 +694,7 @@ export default function Home() {
     setResult(p.result);
     setSelectedKey(p.selectedKey || p.result.key);
     setTranspose(p.transpose ?? null);
+    setAudioChannel(p.audioChannel || p.result.inputChannel || "mix");
     setProjectId(p.id);
     setView("workspace");
   }
@@ -1304,7 +1324,7 @@ export default function Home() {
                           Choose a file <ArrowRight size={15} />
                         </button>
                         <small>
-                          WAV, MP3, M4A, FLAC or WebM · 25 MB / 60 sec max
+                          WAV, MP3, M4A, FLAC or WebM · 64 MiB / 5 min max · longer files: select a section
                         </small>
                       </div>
                     )}
@@ -1338,6 +1358,10 @@ export default function Home() {
                           className="audio-native"
                           aria-label="Preview recording"
                         />
+                        <div className="channel-choice">
+                          <label>Audio source <select aria-label="Audio source" value={audioChannel} onChange={e=>setAudioChannel(e.target.value as "mix" | "left" | "right")}><option value="mix">Mix channels (default)</option><option value="left">Left channel only</option><option value="right">Right channel only</option></select></label>
+                          <p>Use a single channel only if it already contains an isolated voice. This does not separate music mixed with the voice.</p>
+                        </div>
                         <div className="section-select">
                           <label>
                             <input
@@ -1654,6 +1678,26 @@ export default function Home() {
                           <span>SECTION PLAYBACK</span>
                           <span>Set a range to replay or analyse</span>
                         </div>
+                        {duration > 30 && (
+                          <label className="part-selector">
+                            Jump to a 30-second part
+                            <select value={sectionPreset} onChange={(e) => {
+                              const value=e.target.value;
+                              setSectionPreset(value);
+                              if (value === "") return;
+                              const part=Number(value), start=part*30, end=Math.min((part+1)*30, duration);
+                              setSectionStart(start); setSectionEnd(end); setSectionName(`Part ${part+1}`);
+                              setShowSelectedNotes(true); setActiveNote(null);
+                              if (audioRef.current) audioRef.current.currentTime=start;
+                            }}>
+                              <option value="">Custom selection</option>
+                              {Array.from({length: Math.ceil(duration / 30)}, (_, i) => (
+                                <option value={i} key={i}>Part {i+1} · {time(i*30)}–{time(Math.min((i+1)*30, duration))}</option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                        <div className="channel-choice compact"><label>Audio source for reanalysis <select aria-label="Audio source for reanalysis" value={audioChannel} onChange={e=>setAudioChannel(e.target.value as "mix" | "left" | "right")}><option value="mix">Mix channels</option><option value="left">Left channel only</option><option value="right">Right channel only</option></select></label><p>Choose a channel with isolated vocals, if available; changing this requires reanalysis.</p></div>
                         <div className="selection-fields">
                           <label>
                             Name{" "}
@@ -1671,9 +1715,7 @@ export default function Home() {
                               max={duration}
                               step="0.1"
                               value={sectionStart}
-                              onChange={(e) =>
-                                setSectionStart(Number(e.target.value))
-                              }
+                              onChange={(e) => { setSectionPreset(""); setSectionStart(Number(e.target.value)); }}
                             />
                           </label>
                           <label>
@@ -1684,9 +1726,7 @@ export default function Home() {
                               max={duration}
                               step="0.1"
                               value={sectionEnd}
-                              onChange={(e) =>
-                                setSectionEnd(Number(e.target.value))
-                              }
+                              onChange={(e) => { setSectionPreset(""); setSectionEnd(Number(e.target.value)); }}
                             />
                           </label>
                           <label className="loop-check">
@@ -1711,6 +1751,7 @@ export default function Home() {
                             {busy ? "Analysing…" : "Analyse section"}
                           </button>
                         </div>
+                        <label className="show-part-check"><input type="checkbox" checked={showSelectedNotes} onChange={(e) => setShowSelectedNotes(e.target.checked)} /> Show only notes in this section</label>
                         {busy && (
                           <div className="section-progress" role="status">
                             {status} · {progress}%
@@ -1727,7 +1768,8 @@ export default function Home() {
                           <h2>Notes & tonic solfa</h2>
                           <p>
                             Click a note to edit its pitch or timing, or add a
-                            note in a gap.
+                            note in a gap. Notes marked “check” have weaker
+                            voicing evidence and may need review.
                           </p>
                         </div>
                         <button
@@ -1748,15 +1790,17 @@ export default function Home() {
                           <Copy size={15} /> Copy solfa
                         </button>
                       </div>
+                      {showSelectedNotes && <p className="part-note">Showing {visibleNotes.length} of {displayed.length} notes for {time(sectionStart)}–{time(sectionEnd)}. Exports and copy include all notes.</p>}
                       <div className="solfa-list">
-                        {displayed.map((n, i) => (
+                        {visibleNotes.length === 0 && <p className="part-note">No notes in this section.</p>}
+                        {visibleNotes.map(({note: n, index: i}, visibleIndex) => (
                           <React.Fragment key={i}>
-                            {i > 0 && n.start - displayed[i - 1].end > 0.2 && (
+                            {visibleIndex > 0 && n.start - visibleNotes[visibleIndex - 1].note.end > 0.2 && (
                               <div className="rest">
                                 <b>—</b>
                                 <span>REST</span>
                                 <small>
-                                  {(n.start - displayed[i - 1].end).toFixed(1)}s
+                                  {(n.start - visibleNotes[visibleIndex - 1].note.end).toFixed(1)}s
                                 </small>
                               </div>
                             )}
@@ -1775,6 +1819,7 @@ export default function Home() {
                               <b>{n.solfa}</b>
                               <span>{n.name}</span>
                               <small>{(n.end - n.start).toFixed(1)}s</small>
+                              {n.confidence !== null && n.confidence < 0.35 && <small className="review-note" title="Weak pYIN voicing evidence; check this note">check</small>}
                             </button>
                           </React.Fragment>
                         ))}
@@ -1950,6 +1995,7 @@ export default function Home() {
                         <span>Duration</span>
                         <b>{time(result.duration)}</b>
                       </div>
+                      <div className="detail"><span>Analysed channel</span><b>{result.inputChannel === "left" ? "Left" : result.inputChannel === "right" ? "Right" : "Mix"}</b></div>
                       <div className="detail">
                         <span>Pitch method</span>
                         <b>pYIN</b>

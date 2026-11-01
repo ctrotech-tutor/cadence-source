@@ -1,16 +1,17 @@
 import os, uuid, tempfile, subprocess, threading, time, json, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Literal
 import soundfile as sf
 import imageio_ffmpeg
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 
 app=FastAPI(title='Cadence audio engine', version='0.1.0')
 # Bounded, in-process jobs are intended for single-instance development only.
 jobs={}; lock=threading.Lock(); executor=ThreadPoolExecutor(max_workers=1)
-MAX_BYTES=int(os.getenv('MAX_AUDIO_BYTES',str(25*1024*1024)))
-MAX_SECONDS=int(os.getenv('MAX_AUDIO_SECONDS','60'))
-ANALYSIS_TIMEOUT=int(os.getenv('MAX_ANALYSIS_SECONDS','300'))
+MAX_BYTES=int(os.getenv('MAX_AUDIO_BYTES',str(64*1024*1024)))
+MAX_SECONDS=int(os.getenv('MAX_AUDIO_SECONDS','300'))
+ANALYSIS_TIMEOUT=int(os.getenv('MAX_ANALYSIS_SECONDS','1200'))
 
 class UploadLimitMiddleware:
     """Bound request bytes *before* the multipart parser, including chunked requests."""
@@ -47,16 +48,18 @@ def update(id,**kwargs):
     with lock:
         if id in jobs: jobs[id].update(kwargs)
 
-def process(id,path):
+def process(id,path,channel="mix"):
     wav=path+'.wav'
     try:
         update(id,status='processing',progress=8,message='Decoding audio')
         # Decode content, not filename/MIME. Bound decode time and decoded duration.
-        cmd=[imageio_ffmpeg.get_ffmpeg_exe(),'-nostdin','-v','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,mov,flac,matroska,webm,ogg,aac','-i',path,'-t',str(MAX_SECONDS+1),'-ac','1','-ar','22050','-f','wav',wav]
+        cmd=[imageio_ffmpeg.get_ffmpeg_exe(),'-nostdin','-v','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,mov,flac,matroska,webm,ogg,aac','-i',path,'-t',str(MAX_SECONDS+1)]
+        if channel!='mix': cmd.extend(['-af',f"pan=mono|c0=c{0 if channel=='left' else 1}"])
+        cmd.extend(['-ac','1','-ar','22050','-f','wav',wav])
         p=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=45)
-        if p.returncode: raise ValueError('This file could not be decoded as audio. Try WAV, MP3, M4A, FLAC or WebM.')
+        if p.returncode: raise ValueError('Audio could not be decoded. Check the selected channel, or try WAV, MP3, M4A, FLAC or WebM.')
         info=sf.info(wav)
-        if info.duration>MAX_SECONDS: raise ValueError(f'Audio exceeds the {MAX_SECONDS}-second limit.')
+        if info.duration>MAX_SECONDS: raise ValueError(f'Audio exceeds the {MAX_SECONDS}-second limit. Select a shorter section and try again.')
         update(id,progress=15,message='Starting analysis worker')
         # pYIN/Viterbi can monopolise the GIL and memory on long recordings.
         # A child process keeps the HTTP server responsive and can be timed out.
@@ -80,7 +83,7 @@ def process(id,path):
                     except (json.JSONDecodeError,ValueError): continue
                     if message.get('type')=='progress':
                         update(id,progress=message['progress'],message=message['message'])
-                    elif message.get('type')=='result': result=message['result']
+                    elif message.get('type')=='result': result=message['result']; result['inputChannel']=channel
                     elif message.get('type')=='error': worker_error=message.get('message')
                 return_code=worker.wait()
             finally:
@@ -92,6 +95,8 @@ def process(id,path):
             if return_code!=0 or result is None:
                 errors.seek(0); detail=errors.read()[-4000:].decode('utf-8',errors='replace')
                 if detail: print('Analysis worker error:',detail,flush=True)
+                if channel!='mix' and worker_error and worker_error.startswith('No usable signal'):
+                    raise ValueError(f'The selected {channel} channel is silent or unavailable. Choose another channel and try again.')
                 raise ValueError(worker_error or 'The analysis worker stopped unexpectedly. Try a shorter recording and check the audio engine log.')
         update(id,status='completed',progress=100,message='Analysis complete',result=result)
     except ValueError as e: update(id,status='failed',message=str(e))
@@ -107,7 +112,7 @@ def process(id,path):
 def health(): return {'ok':True}
 
 @app.post('/jobs',status_code=202)
-async def create_job(file:UploadFile=File(...)):
+async def create_job(file:UploadFile=File(...),channel:Literal['mix','left','right']=Form(default='mix')):
     with lock:
         now=time.time()
         for k in list(jobs):
@@ -121,7 +126,7 @@ async def create_job(file:UploadFile=File(...)):
                 chunk=await file.read(1024*1024)
                 if not chunk: break
                 size+=len(chunk)
-                if size>MAX_BYTES: raise HTTPException(413,'File exceeds the 25 MB limit.')
+                if size>MAX_BYTES: raise HTTPException(413,f'File exceeds the configured {MAX_BYTES // (1024*1024)} MiB limit.')
                 tmp.write(chunk)
         if size==0: raise HTTPException(400,'The uploaded file is empty.')
         id=uuid.uuid4().hex
@@ -130,7 +135,7 @@ async def create_job(file:UploadFile=File(...)):
             if sum(j['status'] in ('queued','processing') for j in jobs.values())>=8:
                 raise HTTPException(429,'Analysis queue is full. Please try again shortly.')
             jobs[id]={'id':id,'status':'queued','progress':0,'message':'Waiting for an available worker','created':time.time()}
-        executor.submit(process,id,path)
+        executor.submit(process,id,path,channel)
         return {'id':id}
     except Exception:
         if path and os.path.exists(path): os.unlink(path)

@@ -2,8 +2,8 @@ services:
   audio-engine:
     build: ./apps/audio-engine
     environment:
-      MAX_AUDIO_BYTES: 26214400
-      MAX_AUDIO_SECONDS: 60
+      MAX_AUDIO_BYTES: 67108864
+      MAX_AUDIO_SECONDS: 300
   web:
     build: ./apps/web
     ports:
