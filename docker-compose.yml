@@ -1,0 +1,14 @@
+services:
+  audio-engine:
+    build: ./apps/audio-engine
+    environment:
+      MAX_AUDIO_BYTES: 26214400
+      MAX_AUDIO_SECONDS: 60
+  web:
+    build: ./apps/web
+    ports:
+      - "3000:3000"
+    environment:
+      AUDIO_ENGINE_URL: http://audio-engine:8000
+    depends_on:
+      - audio-engine
