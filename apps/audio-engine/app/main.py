@@ -1,16 +1,16 @@
-import os, uuid, tempfile, subprocess, threading, time, json
+import os, uuid, tempfile, subprocess, threading, time, json, sys
 from concurrent.futures import ThreadPoolExecutor
-import numpy as np
+from pathlib import Path
 import soundfile as sf
 import imageio_ffmpeg
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from .analysis import analyse
 
 app=FastAPI(title='Cadence audio engine', version='0.1.0')
 # Bounded, in-process jobs are intended for single-instance development only.
-jobs={}; lock=threading.Lock(); executor=ThreadPoolExecutor(max_workers=2)
+jobs={}; lock=threading.Lock(); executor=ThreadPoolExecutor(max_workers=1)
 MAX_BYTES=int(os.getenv('MAX_AUDIO_BYTES',str(25*1024*1024)))
 MAX_SECONDS=int(os.getenv('MAX_AUDIO_SECONDS','60'))
+ANALYSIS_TIMEOUT=int(os.getenv('MAX_ANALYSIS_SECONDS','300'))
 
 class UploadLimitMiddleware:
     """Bound request bytes *before* the multipart parser, including chunked requests."""
@@ -55,9 +55,44 @@ def process(id,path):
         cmd=[imageio_ffmpeg.get_ffmpeg_exe(),'-nostdin','-v','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,mov,flac,matroska,webm,ogg,aac','-i',path,'-t',str(MAX_SECONDS+1),'-ac','1','-ar','22050','-f','wav',wav]
         p=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=45)
         if p.returncode: raise ValueError('This file could not be decoded as audio. Try WAV, MP3, M4A, FLAC or WebM.')
-        y,sr=sf.read(wav,dtype='float32')
-        if len(y)/sr>MAX_SECONDS: raise ValueError(f'Audio exceeds the {MAX_SECONDS}-second limit.')
-        result=analyse(y,sr,lambda value,msg:update(id,progress=value,message=msg))
+        info=sf.info(wav)
+        if info.duration>MAX_SECONDS: raise ValueError(f'Audio exceeds the {MAX_SECONDS}-second limit.')
+        update(id,progress=15,message='Starting analysis worker')
+        # pYIN/Viterbi can monopolise the GIL and memory on long recordings.
+        # A child process keeps the HTTP server responsive and can be timed out.
+        env=os.environ.copy()
+        env['OPENBLAS_NUM_THREADS']='1'; env['OMP_NUM_THREADS']='1'; env['MKL_NUM_THREADS']='1'
+        with tempfile.TemporaryFile(mode='w+b') as errors:
+            worker=subprocess.Popen([sys.executable,'-u','-m','app.worker',wav],
+                stdout=subprocess.PIPE,stderr=errors,text=True,encoding='utf-8',errors='replace',env=env,
+                cwd=str(Path(__file__).resolve().parent.parent))
+            timed_out=threading.Event()
+            def terminate():
+                timed_out.set()
+                try: worker.kill()
+                except OSError: pass
+            timer=threading.Timer(ANALYSIS_TIMEOUT,terminate); timer.daemon=True; timer.start()
+            result=None; worker_error=None
+            try:
+                assert worker.stdout is not None
+                for line in worker.stdout:
+                    try: message=json.loads(line)
+                    except (json.JSONDecodeError,ValueError): continue
+                    if message.get('type')=='progress':
+                        update(id,progress=message['progress'],message=message['message'])
+                    elif message.get('type')=='result': result=message['result']
+                    elif message.get('type')=='error': worker_error=message.get('message')
+                return_code=worker.wait()
+            finally:
+                timer.cancel()
+                if worker.poll() is None:
+                    worker.kill(); worker.wait()
+                if worker.stdout: worker.stdout.close()
+            if timed_out.is_set(): raise ValueError('Analysis took too long. Try selecting a shorter section and analyse again.')
+            if return_code!=0 or result is None:
+                errors.seek(0); detail=errors.read()[-4000:].decode('utf-8',errors='replace')
+                if detail: print('Analysis worker error:',detail,flush=True)
+                raise ValueError(worker_error or 'The analysis worker stopped unexpectedly. Try a shorter recording and check the audio engine log.')
         update(id,status='completed',progress=100,message='Analysis complete',result=result)
     except ValueError as e: update(id,status='failed',message=str(e))
     except subprocess.TimeoutExpired: update(id,status='failed',message='Audio decoding timed out. Try a shorter recording.')

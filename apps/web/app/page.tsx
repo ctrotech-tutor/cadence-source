@@ -533,7 +533,8 @@ export default function Home() {
       });
       if (version !== analysisVersion.current) return;
       let finished = false;
-      const deadline = Date.now() + 5 * 60 * 1000;
+      let transientFailures = 0;
+      const deadline = Date.now() + 8 * 60 * 1000;
       while (!finished) {
         if (version !== analysisVersion.current) return;
         if (Date.now() > deadline)
@@ -541,11 +542,25 @@ export default function Home() {
             "Analysis is taking too long. Please try a shorter recording.",
           );
         await new Promise((r) => setTimeout(r, 1000));
-        const response = await fetch("/api/jobs/" + id, { cache: "no-store" });
-        const job = await response.json();
+        let response: Response;
+        try {
+          response = await fetch("/api/jobs/" + id, { cache: "no-store" });
+        } catch {
+          if (++transientFailures <= 3) {
+            setStatus("Connection interrupted. Retrying status…");
+            continue;
+          }
+          throw Error("Could not contact the audio engine. Check its terminal, then try again.");
+        }
         if (version !== analysisVersion.current) return;
+        if (response.status === 503 && ++transientFailures <= 3) {
+          setStatus("Audio engine is slow to respond. Retrying status…");
+          continue;
+        }
+        const job = await response.json();
         if (!response.ok)
           throw Error(job.detail || "Could not retrieve analysis.");
+        transientFailures = 0;
         setProgress(job.progress);
         setStatus(job.message);
         if (job.status === "failed") throw Error(job.message);

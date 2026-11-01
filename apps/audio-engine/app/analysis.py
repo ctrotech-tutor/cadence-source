@@ -30,6 +30,32 @@ def estimate_key(notes):
     candidates.sort(key=lambda x:x['score'],reverse=True)
     return candidates[:5]
 
+def track_pitch_in_chunks(y, sr, hop, progress=lambda *args: None, chunk_seconds=8.0):
+    """Bound pYIN memory by tracking overlapped, frame-aligned chunks.
+
+    The retained center of each chunk has context on both sides. pYIN runs
+    its Viterbi decoder independently on each chunk, so a boundary can still
+    differ slightly from a single whole-file pass.
+    """
+    frame_length=2048
+    chunk_frames=max(1, round(chunk_seconds*sr/hop))
+    context_frames=max(1, round(.4*sr/hop))
+    total_frames=1+len(y)//hop
+    f0_parts=[]; probability_parts=[]
+    for start in range(0,total_frames,chunk_frames):
+        end=min(total_frames,start+chunk_frames)
+        context_start=max(0,start-context_frames)
+        context_end=min(total_frames,end+context_frames)
+        segment=y[context_start*hop:min(len(y),context_end*hop)]
+        f0, _, probability=librosa.pyin(
+            segment, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'),
+            sr=sr, frame_length=frame_length, hop_length=hop, fill_na=np.nan)
+        a=start-context_start; b=end-context_start
+        if len(f0)<b: raise RuntimeError('Pitch tracker returned an incomplete frame sequence.')
+        f0_parts.append(f0[a:b]); probability_parts.append(probability[a:b])
+        progress(25+round(35*end/total_frames),f'Tracking vocal pitch ({min(round(end/total_frames*100),100)}%)')
+    return np.concatenate(f0_parts), np.concatenate(probability_parts)
+
 def analyse(y, sr, progress=lambda *args: None):
     y=np.asarray(y,dtype=np.float32)
     duration=len(y)/sr
@@ -46,7 +72,7 @@ def analyse(y, sr, progress=lambda *args: None):
     # Moderate normalisation preserves timing and avoids suppressing fundamental frequencies.
     y=y/max(peak, .001)*.9
     hop=256
-    f0, voiced, probability=librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr, frame_length=2048, hop_length=hop, fill_na=np.nan)
+    f0, probability=track_pitch_in_chunks(y,sr,hop,progress)
     midi_float=librosa.hz_to_midi(f0)
     # Median filter pitch only within voiced islands to prevent glides and vibrato fragmenting notes.
     mask=np.isfinite(midi_float) & (probability >= .35)

@@ -112,3 +112,42 @@ def test_bounded_multipart_request(monkeypatch):
     with TestClient(main.app) as client:
         response=client.post('/jobs',files={'file':('huge.wav',b'x'*(1024*1024+1024),'audio/wav')})
     assert response.status_code==413
+
+def test_long_job_stays_responsive_and_preserves_chunk_boundary():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    import io, soundfile as sf, time
+    sr=22050; t=np.arange(sr*18)/sr
+    tone=.4*np.sin(2*np.pi*440*t).astype('float32')
+    buf=io.BytesIO();sf.write(buf,tone,sr,format='WAV');buf.seek(0)
+    with TestClient(app) as client:
+        response=client.post('/jobs',files={'file':('long.wav',buf,'audio/wav')})
+        assert response.status_code==202
+        id=response.json()['id']; deadline=time.monotonic()+150; slowest=0; observed=set()
+        while time.monotonic()<deadline:
+            start=time.monotonic();status=client.get('/jobs/'+id);slowest=max(slowest,time.monotonic()-start)
+            assert status.status_code==200
+            job=status.json();observed.add(job['status'])
+            if job['status'] in ('failed','completed'): break
+            time.sleep(.2)
+    assert job['status']=='completed',job
+    assert slowest<5, f'Polling stalled for {slowest:.1f}s'
+    assert [n['midi'] for n in job['result']['notes']]==[69]
+    assert job['result']['notes'][0]['end']>17.8
+    assert 'processing' in observed
+
+def test_worker_timeout_reports_actionable_error(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app.main as main
+    import io, soundfile as sf, time
+    monkeypatch.setattr(main,'ANALYSIS_TIMEOUT',.01)
+    sr=22050; t=np.arange(sr)/sr; b=io.BytesIO();sf.write(b,.3*np.sin(2*np.pi*440*t),sr,format='WAV');b.seek(0)
+    with TestClient(main.app) as client:
+        res=client.post('/jobs',files={'file':('tone.wav',b,'audio/wav')});assert res.status_code==202
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            job=client.get('/jobs/'+res.json()['id']).json()
+            if job['status'] in ('failed','completed'): break
+            time.sleep(.1)
+    assert job['status']=='failed'
+    assert 'shorter section' in job['message']

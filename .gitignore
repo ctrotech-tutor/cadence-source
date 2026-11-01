@@ -1,5 +1,30 @@
+# Dependencies, generated output and local development files
 node_modules/
 .next/
 .venv/
 __pycache__/
 .pytest_cache/
+*.tsbuildinfo
+dist/
+build/
+coverage/
+*.log
+
+# Local configuration, recordings and project data
+.env
+.env.*
+!.env.example
+.data/
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.webm
+*.ogg
+*.opus
+*.mid
+*.midi
+*.sqlite
+*.sqlite3
+*.db

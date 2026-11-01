@@ -58,16 +58,17 @@ async function forward(
       method: req.method,
       body,
       headers,
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(req.method === "GET" ? 8000 : 30000),
       cache: "no-store",
     });
     return new NextResponse(await res.text(), {
       status: res.status,
       headers: { "Content-Type": "application/json" },
     });
-  } catch {
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === "TimeoutError";
     return NextResponse.json(
-      { detail: "Audio service is unavailable. Please try again." },
+      { detail: timedOut ? "The audio engine did not respond in time. Check its terminal for errors." : "Cannot connect to the audio engine. Check that it is still running and review its terminal." },
       { status: 503 },
     );
   }
